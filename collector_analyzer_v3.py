@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # collector_analyzer_v3.py
 # Raccoglie captcha con figure ritagliate e etichette
+# Con recupero automatico della sessione
 
 import os
 import sys
@@ -200,7 +201,6 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
             table = "figure_captchas_analyzer"
             stats['figure'] += 1
             
-            # Crea sottocartella nel bucket
             folder_name = f"{prefix}/{timestamp}_{account_name}"
             
             # 1. Salva immagine intera
@@ -209,7 +209,7 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
             img_bytes = buffer.tobytes()
             supabase_client.storage.from_(BUCKET_NAME).upload(file_path, img_bytes)
             
-            # 2. Salva le 5 figure ritagliate con le loro etichette
+            # 2. Salva le 5 figure ritagliate
             crop_paths = []
             crop_labels = []
             for i, p in enumerate(picmap):
@@ -271,21 +271,23 @@ def log(msg):
 
 # ==================== SURF ACCOUNT ====================
 def surf_account(account_name, cookie_string, stats, supabase_client):
-    """Esegue surf per un account (thread) con loop infinito"""
-    session = requests.Session()
+    """Esegue surf per un account (thread) con loop infinito e recupero sessione"""
     
-    # 🔑 IMPOSTA IL COOKIE COMPLETO
-    session.headers.update({"Cookie": cookie_string})
+    def init_session():
+        """Crea e attiva una nuova sessione"""
+        session = requests.Session()
+        session.headers.update({"Cookie": cookie_string})
+        try:
+            log(f"[{account_name}] 🔄 Attivazione sessione surf...")
+            session.get("https://www.easyhits4u.com/surf/", verify=False, timeout=10)
+            time.sleep(2)
+        except Exception as e:
+            log(f"[{account_name}] ⚠️ Errore attivazione surf: {e}")
+        return session
+    
+    session = init_session()
     
     log(f"📧 Account: {account_name}")
-    
-    # 🔑 PASSO FONDAMENTALE: Attiva la sessione di surf
-    try:
-        log(f"[{account_name}] 🔄 Attivazione sessione surf...")
-        session.get("https://www.easyhits4u.com/surf/", verify=False, timeout=10)
-        time.sleep(2)
-    except Exception as e:
-        log(f"[{account_name}] ⚠️ Errore attivazione surf: {e}")
     
     errori_consecutivi = 0
     MAX_ERRORI = 5
@@ -293,13 +295,19 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
     
     while True:
         try:
-            # 2. Ora chiedi il captcha (dopo aver attivato la sessione)
+            # Richiedi captcha
             r = session.post(
                 "https://www.easyhits4u.com/surf/?ajax=1&try=1",
                 verify=False, timeout=REQUEST_TIMEOUT
             )
             
             if r.status_code != 200:
+                errori_consecutivi += 1
+                log(f"[{account_name}] ⚠️ HTTP {r.status_code}")
+                if errori_consecutivi >= MAX_ERRORI:
+                    log(f"[{account_name}] 🔄 Riavvio sessione...")
+                    session = init_session()
+                    errori_consecutivi = 0
                 time.sleep(3)
                 continue
             
@@ -310,15 +318,18 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             seconds = int(surfses.get("seconds", 20))
             picmap = data.get("picmap")
             
+            # Se non c'è captcha, riprova
             if not urlid or not qpic:
-                log(f"[{account_name}] ⚠️ Nessun captcha trovato")
                 errori_consecutivi += 1
+                log(f"[{account_name}] ⚠️ Nessun captcha trovato ({errori_consecutivi}/{MAX_ERRORI})")
                 if errori_consecutivi >= MAX_ERRORI:
-                    log(f"[{account_name}] ❌ Troppi errori, fermo account")
-                    return
-                time.sleep(3)
+                    log(f"[{account_name}] 🔄 Riavvio sessione per captcha assente...")
+                    session = init_session()
+                    errori_consecutivi = 0
+                time.sleep(5)
                 continue
             
+            # Reset errori se abbiamo un captcha
             errori_consecutivi = 0
             
             # Scarica l'immagine
@@ -388,14 +399,15 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             log(f"[{account_name}] ❌ Errore: {e}")
             errori_consecutivi += 1
             if errori_consecutivi >= MAX_ERRORI:
-                log(f"[{account_name}] ❌ Troppi errori, fermo account")
-                return
+                log(f"[{account_name}] 🔄 Riavvio sessione per errore...")
+                session = init_session()
+                errori_consecutivi = 0
             time.sleep(5)
 
 # ==================== MAIN ====================
 def main():
     log("=" * 60)
-    log("🚀 COLLECTOR ANALYZER V3 - CON FIGURE RITAGLIATE")
+    log("🚀 COLLECTOR ANALYZER V3 - CON RECUPERO SESSIONE")
     log("=" * 60)
     
     # Connessione al Captcha DB

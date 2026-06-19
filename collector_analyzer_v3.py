@@ -59,7 +59,7 @@ classes_fast = None
 def load_dataset_from_hf():
     """Carica il dataset da Hugging Face"""
     global X_fast, y_fast, classes_fast
-    log(f"📥 Caricamento dataset da Hugging Face: {DATASET_REPO}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📥 Caricamento dataset da Hugging Face: {DATASET_REPO}", flush=True)
     
     try:
         dataset = load_dataset(DATASET_REPO, trust_remote_code=True)
@@ -90,13 +90,13 @@ def load_dataset_from_hf():
             X_fast = np.vstack(X).astype(np.float32)
             y_fast = np.array(y, dtype=np.int32)
             classes_fast = {v: k for k, v in class_to_idx.items()}
-            log(f"✅ Dataset caricato: {X_fast.shape[0]} vettori, {len(classes_fast)} classi")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Dataset caricato: {X_fast.shape[0]} vettori, {len(classes_fast)} classi", flush=True)
             return True
         else:
-            log("❌ Nessun dato valido nel dataset")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Nessun dato valido nel dataset", flush=True)
             return False
     except Exception as e:
-        log(f"❌ Errore caricamento dataset: {e}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Errore caricamento dataset: {e}", flush=True)
         return False
 
 # ==================== FUNZIONI FIGURE ====================
@@ -113,7 +113,7 @@ def centra_figura(image):
         return cv2.resize(image, (DIM, DIM))
     cnt = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(cnt)
-    crop = image[y:y+h, x:x+w)
+    crop = image[y:y+h, x:x+w]   # <--- CORRETTO!
     return cv2.resize(crop, (DIM, DIM))
 
 def estrai_descrittori(img):
@@ -186,7 +186,8 @@ def crop_safe(img, coords):
     y2 = max(0, min(h, y2))
     if x2 <= x1 or y2 <= y1:
         return None
-    return img[y1:y2, x1:x2]
+    crop = img[y1:y2, x1:x2]   # <--- CORRETTO!
+    return crop
 
 # ==================== SALVATAGGIO CAPTCHA ====================
 def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, labels, motivo, urlid, stats):
@@ -263,6 +264,10 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
     except Exception as e:
         log(f"[{account_name}] ❌ Errore salvataggio: {e}")
         return False
+
+def log(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=True)
 
 # ==================== SURF ACCOUNT ====================
 def surf_account(account_name, cookie_string, stats, supabase_client):
@@ -381,10 +386,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 log(f"[{account_name}] ❌ Troppi errori, fermo account")
                 return
             time.sleep(5)
-
-def log(msg):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}", flush=True)
 
 # ==================== MAIN ====================
 def main():

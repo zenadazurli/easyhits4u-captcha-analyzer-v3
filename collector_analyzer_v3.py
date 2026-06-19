@@ -113,7 +113,7 @@ def centra_figura(image):
         return cv2.resize(image, (DIM, DIM))
     cnt = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(cnt)
-    crop = image[y:y+h, x:x+w]   # <--- CORRETTO!
+    crop = image[y:y+h, x:x+w]
     return cv2.resize(crop, (DIM, DIM))
 
 def estrai_descrittori(img):
@@ -186,7 +186,7 @@ def crop_safe(img, coords):
     y2 = max(0, min(h, y2))
     if x2 <= x1 or y2 <= y1:
         return None
-    crop = img[y1:y2, x1:x2]   # <--- CORRETTO!
+    crop = img[y1:y2, x1:x2]
     return crop
 
 # ==================== SALVATAGGIO CAPTCHA ====================
@@ -273,11 +273,15 @@ def log(msg):
 def surf_account(account_name, cookie_string, stats, supabase_client):
     """Esegue surf per un account (thread) con loop infinito"""
     session = requests.Session()
+    
+    # 🔑 IMPOSTA IL COOKIE COMPLETO
     session.headers.update({"Cookie": cookie_string})
     
     log(f"📧 Account: {account_name}")
     
+    # 🔑 PASSO FONDAMENTALE: Attiva la sessione di surf
     try:
+        log(f"[{account_name}] 🔄 Attivazione sessione surf...")
         session.get("https://www.easyhits4u.com/surf/", verify=False, timeout=10)
         time.sleep(2)
     except Exception as e:
@@ -289,6 +293,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
     
     while True:
         try:
+            # 2. Ora chiedi il captcha (dopo aver attivato la sessione)
             r = session.post(
                 "https://www.easyhits4u.com/surf/?ajax=1&try=1",
                 verify=False, timeout=REQUEST_TIMEOUT

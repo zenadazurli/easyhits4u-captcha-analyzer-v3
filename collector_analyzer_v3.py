@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # collector_analyzer_v3.py
 # Raccoglie captcha con figure ritagliate e etichette
-# Con refresh periodico della sessione e supporto proxy
+# Con refresh periodico della sessione, proxy, e ritardo casuale
 
 import os
 import sys
@@ -33,13 +33,7 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 3))
 STAGGERED_START_DELAY = int(os.environ.get("STAGGERED_START_DELAY", 5))
 REFRESH_INTERVAL = 1200  # Refresh sessione ogni 20 minuti
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("❌ SUPABASE_URL e SUPABASE_KEY devono essere impostate")
-if not COOKIE_SUPABASE_URL or not COOKIE_SUPABASE_KEY:
-    raise ValueError("❌ COOKIE_SUPABASE_URL e COOKIE_SUPABASE_KEY devono essere impostate")
-
 # ==================== PROXY ====================
-# Lista dei proxy disponibili (username:password@host:port)
 PROXY_LIST = [
     "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:13822",
     "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:14693",
@@ -141,7 +135,7 @@ def centra_figura(image):
         return cv2.resize(image, (DIM, DIM))
     cnt = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(cnt)
-    crop = image[y:y+h, x:x+w]
+    crop = image[y:y+h, x:x+w)
     return cv2.resize(crop, (DIM, DIM))
 
 def estrai_descrittori(img):
@@ -304,7 +298,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
         """Crea una sessione con header realistici e proxy opzionale"""
         session = requests.Session()
         
-        # Header completi per sembrare un browser
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -319,11 +312,8 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             "Cache-Control": "max-age=0",
         }
         session.headers.update(headers)
-        
-        # Imposta il cookie
         session.headers.update({"Cookie": cookie_string})
         
-        # Se c'è un proxy, configuralo
         if proxy:
             proxy_url = f"http://{proxy}"
             session.proxies = {
@@ -332,7 +322,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             }
             log(f"[{account_name}] 🌐 Proxy: {proxy.split('@')[1] if '@' in proxy else proxy}")
         
-        # Attiva la sessione di surf
         try:
             log(f"[{account_name}] 🔄 Attivazione sessione surf...")
             session.get("https://www.easyhits4u.com/surf/", verify=False, timeout=10)
@@ -342,11 +331,9 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
         
         return session
     
-    # Ottieni un proxy per questo account
     proxy = get_next_proxy()
     log(f"[{account_name}] 🌐 Assegnato proxy: {proxy.split('@')[1] if '@' in proxy else proxy}")
     
-    # Sessione iniziale con proxy
     session = init_session(proxy)
     ultimo_refresh = time.time()
     
@@ -357,7 +344,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
     captcha_counter = 0
     
     while True:
-        # 🔄 REFRESH PERIODICO: ogni 20 minuti ricrea la sessione
         if time.time() - ultimo_refresh > REFRESH_INTERVAL:
             log(f"[{account_name}] 🔄 Refresh periodico della sessione...")
             session = init_session(proxy)
@@ -365,7 +351,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             errori_consecutivi = 0
         
         try:
-            # Richiedi captcha
             r = session.post(
                 "https://www.easyhits4u.com/surf/?ajax=1&try=1",
                 verify=False, timeout=REQUEST_TIMEOUT
@@ -389,7 +374,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             seconds = int(surfses.get("seconds", 20))
             picmap = data.get("picmap")
             
-            # Se non c'è captcha, riprova
             if not urlid or not qpic:
                 errori_consecutivi += 1
                 log(f"[{account_name}] ⚠️ Nessun captcha trovato ({errori_consecutivi}/{MAX_ERRORI})")
@@ -401,7 +385,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 time.sleep(5)
                 continue
             
-            # Reset errori se abbiamo un captcha
             errori_consecutivi = 0
             
             # Scarica l'immagine
@@ -422,7 +405,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                     else:
                         labels.append(None)
                 
-                # Cerca duplicati
                 seen = {}
                 chosen_idx = None
                 for i, label in enumerate(labels):
@@ -438,7 +420,12 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                     return
                 
                 word = picmap[chosen_idx]["value"]
-                time.sleep(seconds)
+                
+                # 🔑 ATTESA CON RITARDO CASUALE (come un essere umano)
+                delay_extra = random.uniform(0.5, 3.0)
+                total_delay = seconds + delay_extra
+                log(f"[{account_name}] ⏳ Attesa {total_delay:.1f} secondi ({seconds}s + {delay_extra:.1f}s extra)...")
+                time.sleep(total_delay)
                 
             else:
                 # CAPTCHA MATEMATICO
@@ -465,7 +452,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             if captcha_counter % 10 == 0:
                 log(f"[{account_name}] ✅ OK #{captcha_counter}")
             
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(1.5, 3.0))
             
         except Exception as e:
             log(f"[{account_name}] ❌ Errore: {e}")
@@ -480,23 +467,19 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
 # ==================== MAIN ====================
 def main():
     log("=" * 60)
-    log("🚀 COLLECTOR ANALYZER V3 - CON PROXY E REFRESH PERIODICO")
+    log("🚀 COLLECTOR ANALYZER V3 - CON PROXY E RITARDO CASUALE")
     log("=" * 60)
     
-    # Connessione al Captcha DB
     supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     log(f"📁 Captcha DB: {SUPABASE_URL}")
     
-    # Connessione al Cookie DB
     cookie_supabase = create_client(COOKIE_SUPABASE_URL, COOKIE_SUPABASE_KEY)
     log(f"📁 Cookie DB: {COOKIE_SUPABASE_URL}")
     
-    # Carica dataset
     if not load_dataset_from_hf():
         log("❌ Dataset non caricato")
         return
     
-    # Legge i cookie
     try:
         result = cookie_supabase.table('account_cookies')\
             .select('account_name, cookie_string')\

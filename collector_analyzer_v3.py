@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # collector_analyzer_v3.py
 # Raccoglie captcha con figure ritagliate e etichette
-# Con recupero automatico della sessione
+# Con refresh periodico della sessione
 
 import os
 import sys
@@ -31,6 +31,7 @@ REQUEST_TIMEOUT = 15
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 3))
 STAGGERED_START_DELAY = int(os.environ.get("STAGGERED_START_DELAY", 5))
+REFRESH_INTERVAL = 1200  # Refresh sessione ogni 20 minuti
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("❌ SUPABASE_URL e SUPABASE_KEY devono essere impostate")
@@ -271,21 +272,44 @@ def log(msg):
 
 # ==================== SURF ACCOUNT ====================
 def surf_account(account_name, cookie_string, stats, supabase_client):
-    """Esegue surf per un account (thread) con loop infinito e recupero sessione"""
+    """Esegue surf per un account con refresh periodico della sessione"""
     
     def init_session():
-        """Crea e attiva una nuova sessione"""
+        """Crea una sessione con header realistici (come un browser)"""
         session = requests.Session()
+        
+        # Header completi per sembrare un browser
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
+        session.headers.update(headers)
+        
+        # Imposta il cookie
         session.headers.update({"Cookie": cookie_string})
+        
+        # Attiva la sessione di surf
         try:
             log(f"[{account_name}] 🔄 Attivazione sessione surf...")
             session.get("https://www.easyhits4u.com/surf/", verify=False, timeout=10)
             time.sleep(2)
         except Exception as e:
             log(f"[{account_name}] ⚠️ Errore attivazione surf: {e}")
+        
         return session
     
+    # Sessione iniziale
     session = init_session()
+    ultimo_refresh = time.time()
     
     log(f"📧 Account: {account_name}")
     
@@ -294,6 +318,13 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
     captcha_counter = 0
     
     while True:
+        # 🔄 REFRESH PERIODICO: ogni 20 minuti ricrea la sessione
+        if time.time() - ultimo_refresh > REFRESH_INTERVAL:
+            log(f"[{account_name}] 🔄 Refresh periodico della sessione...")
+            session = init_session()
+            ultimo_refresh = time.time()
+            errori_consecutivi = 0
+        
         try:
             # Richiedi captcha
             r = session.post(
@@ -305,10 +336,11 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 errori_consecutivi += 1
                 log(f"[{account_name}] ⚠️ HTTP {r.status_code}")
                 if errori_consecutivi >= MAX_ERRORI:
-                    log(f"[{account_name}] 🔄 Riavvio sessione...")
+                    log(f"[{account_name}] 🔄 Riavvio sessione per errore HTTP...")
                     session = init_session()
+                    ultimo_refresh = time.time()
                     errori_consecutivi = 0
-                time.sleep(3)
+                time.sleep(5)
                 continue
             
             data = r.json()
@@ -325,6 +357,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 if errori_consecutivi >= MAX_ERRORI:
                     log(f"[{account_name}] 🔄 Riavvio sessione per captcha assente...")
                     session = init_session()
+                    ultimo_refresh = time.time()
                     errori_consecutivi = 0
                 time.sleep(5)
                 continue
@@ -401,13 +434,14 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             if errori_consecutivi >= MAX_ERRORI:
                 log(f"[{account_name}] 🔄 Riavvio sessione per errore...")
                 session = init_session()
+                ultimo_refresh = time.time()
                 errori_consecutivi = 0
             time.sleep(5)
 
 # ==================== MAIN ====================
 def main():
     log("=" * 60)
-    log("🚀 COLLECTOR ANALYZER V3 - CON RECUPERO SESSIONE")
+    log("🚀 COLLECTOR ANALYZER V3 - CON REFRESH PERIODICO")
     log("=" * 60)
     
     # Connessione al Captcha DB

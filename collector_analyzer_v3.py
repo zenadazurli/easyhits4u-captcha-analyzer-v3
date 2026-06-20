@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # collector_analyzer_v3.py
 # Raccoglie captcha con figure ritagliate e etichette
-# Con refresh periodico della sessione
+# Con refresh periodico della sessione e supporto proxy
 
 import os
 import sys
@@ -38,6 +38,22 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 if not COOKIE_SUPABASE_URL or not COOKIE_SUPABASE_KEY:
     raise ValueError("❌ COOKIE_SUPABASE_URL e COOKIE_SUPABASE_KEY devono essere impostate")
 
+# ==================== PROXY ====================
+# Lista dei proxy disponibili (username:password@host:port)
+PROXY_LIST = [
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:13822",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:14693",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:13711",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:14329",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:14012",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:14465",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:13768",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:13506",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:14995",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:13353",
+    "sazz16014w96:t3vz152mql23@resi.fusionproxy.net:13231"
+]
+
 # ==================== ACCOUNT ====================
 NUOVI_ACCOUNT = [
     'unobbufjagl', 'ucutuva', 'ucufrkrreea', 'uvofichiad',
@@ -56,6 +72,16 @@ NUOVI_ACCOUNT = [
 X_fast = None
 y_fast = None
 classes_fast = None
+proxy_index = 0
+proxy_lock = threading.Lock()
+
+def get_next_proxy():
+    """Restituisce il prossimo proxy in rotazione (round-robin)"""
+    global proxy_index
+    with proxy_lock:
+        proxy = PROXY_LIST[proxy_index % len(PROXY_LIST)]
+        proxy_index += 1
+        return proxy
 
 # ==================== FUNZIONI DATASET ====================
 def load_dataset_from_hf():
@@ -272,10 +298,10 @@ def log(msg):
 
 # ==================== SURF ACCOUNT ====================
 def surf_account(account_name, cookie_string, stats, supabase_client):
-    """Esegue surf per un account con refresh periodico della sessione"""
+    """Esegue surf per un account con refresh periodico della sessione e proxy"""
     
-    def init_session():
-        """Crea una sessione con header realistici (come un browser)"""
+    def init_session(proxy=None):
+        """Crea una sessione con header realistici e proxy opzionale"""
         session = requests.Session()
         
         # Header completi per sembrare un browser
@@ -297,6 +323,15 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
         # Imposta il cookie
         session.headers.update({"Cookie": cookie_string})
         
+        # Se c'è un proxy, configuralo
+        if proxy:
+            proxy_url = f"http://{proxy}"
+            session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url
+            }
+            log(f"[{account_name}] 🌐 Proxy: {proxy.split('@')[1] if '@' in proxy else proxy}")
+        
         # Attiva la sessione di surf
         try:
             log(f"[{account_name}] 🔄 Attivazione sessione surf...")
@@ -307,8 +342,12 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
         
         return session
     
-    # Sessione iniziale
-    session = init_session()
+    # Ottieni un proxy per questo account
+    proxy = get_next_proxy()
+    log(f"[{account_name}] 🌐 Assegnato proxy: {proxy.split('@')[1] if '@' in proxy else proxy}")
+    
+    # Sessione iniziale con proxy
+    session = init_session(proxy)
     ultimo_refresh = time.time()
     
     log(f"📧 Account: {account_name}")
@@ -321,7 +360,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
         # 🔄 REFRESH PERIODICO: ogni 20 minuti ricrea la sessione
         if time.time() - ultimo_refresh > REFRESH_INTERVAL:
             log(f"[{account_name}] 🔄 Refresh periodico della sessione...")
-            session = init_session()
+            session = init_session(proxy)
             ultimo_refresh = time.time()
             errori_consecutivi = 0
         
@@ -337,7 +376,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 log(f"[{account_name}] ⚠️ HTTP {r.status_code}")
                 if errori_consecutivi >= MAX_ERRORI:
                     log(f"[{account_name}] 🔄 Riavvio sessione per errore HTTP...")
-                    session = init_session()
+                    session = init_session(proxy)
                     ultimo_refresh = time.time()
                     errori_consecutivi = 0
                 time.sleep(5)
@@ -356,7 +395,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 log(f"[{account_name}] ⚠️ Nessun captcha trovato ({errori_consecutivi}/{MAX_ERRORI})")
                 if errori_consecutivi >= MAX_ERRORI:
                     log(f"[{account_name}] 🔄 Riavvio sessione per captcha assente...")
-                    session = init_session()
+                    session = init_session(proxy)
                     ultimo_refresh = time.time()
                     errori_consecutivi = 0
                 time.sleep(5)
@@ -433,7 +472,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             errori_consecutivi += 1
             if errori_consecutivi >= MAX_ERRORI:
                 log(f"[{account_name}] 🔄 Riavvio sessione per errore...")
-                session = init_session()
+                session = init_session(proxy)
                 ultimo_refresh = time.time()
                 errori_consecutivi = 0
             time.sleep(5)
@@ -441,7 +480,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
 # ==================== MAIN ====================
 def main():
     log("=" * 60)
-    log("🚀 COLLECTOR ANALYZER V3 - CON REFRESH PERIODICO")
+    log("🚀 COLLECTOR ANALYZER V3 - CON PROXY E REFRESH PERIODICO")
     log("=" * 60)
     
     # Connessione al Captcha DB

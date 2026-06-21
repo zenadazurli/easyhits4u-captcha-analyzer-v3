@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # collector_analyzer_v3.py
 # Raccoglie captcha con figure ritagliate e etichette
-# Con refresh periodico della sessione, proxy, e ritardo casuale
+# Con log dettagliati per debug
 
 import os
 import sys
@@ -31,7 +31,12 @@ REQUEST_TIMEOUT = 15
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 3))
 STAGGERED_START_DELAY = int(os.environ.get("STAGGERED_START_DELAY", 5))
-REFRESH_INTERVAL = 1200
+REFRESH_INTERVAL = 1200  # Refresh sessione ogni 20 minuti
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("❌ SUPABASE_URL e SUPABASE_KEY devono essere impostate")
+if not COOKIE_SUPABASE_URL or not COOKIE_SUPABASE_KEY:
+    raise ValueError("❌ COOKIE_SUPABASE_URL e COOKIE_SUPABASE_KEY devono essere impostate")
 
 # ==================== PROXY ====================
 PROXY_LIST = [
@@ -70,6 +75,7 @@ proxy_index = 0
 proxy_lock = threading.Lock()
 
 def get_next_proxy():
+    """Restituisce il prossimo proxy in rotazione (round-robin)"""
     global proxy_index
     with proxy_lock:
         proxy = PROXY_LIST[proxy_index % len(PROXY_LIST)]
@@ -78,6 +84,7 @@ def get_next_proxy():
 
 # ==================== FUNZIONI DATASET ====================
 def load_dataset_from_hf():
+    """Carica il dataset da Hugging Face"""
     global X_fast, y_fast, classes_fast
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 📥 Caricamento dataset da Hugging Face: {DATASET_REPO}", flush=True)
     
@@ -121,6 +128,7 @@ def load_dataset_from_hf():
 
 # ==================== FUNZIONI FIGURE ====================
 def centra_figura(image):
+    """Centra e ritaglia la figura"""
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
@@ -132,10 +140,11 @@ def centra_figura(image):
         return cv2.resize(image, (DIM, DIM))
     cnt = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(cnt)
-    crop = image[y:y+h, x:x+w]   # <--- CORRETTO!
+    crop = image[y:y+h, x:x+w]
     return cv2.resize(crop, (DIM, DIM))
 
 def estrai_descrittori(img):
+    """Estrae descrittori per la figura"""
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
@@ -179,6 +188,7 @@ def estrai_descrittori(img):
     return radiale + spaziale + [circularity, aspect_ratio] + hu
 
 def predict_figure(img_crop):
+    """Riconosce una figura usando il dataset"""
     global X_fast, y_fast, classes_fast
     
     if X_fast is None or img_crop is None or img_crop.size == 0:
@@ -191,6 +201,7 @@ def predict_figure(img_crop):
     return classes_fast.get(int(y_fast[best_idx]), None)
 
 def crop_safe(img, coords):
+    """Ritaglia in sicurezza dalle coordinate"""
     try:
         x1, y1, x2, y2 = map(int, coords.split(","))
     except:
@@ -202,11 +213,12 @@ def crop_safe(img, coords):
     y2 = max(0, min(h, y2))
     if x2 <= x1 or y2 <= y1:
         return None
-    crop = img[y1:y2, x1:x2]   # <--- CORRETTO!
+    crop = img[y1:y2, x1:x2]
     return crop
 
 # ==================== SALVATAGGIO CAPTCHA ====================
 def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, labels, motivo, urlid, stats):
+    """Salva il captcha con figure ritagliate e etichette"""
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S%f")
         
@@ -217,11 +229,13 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
             
             folder_name = f"{prefix}/{timestamp}_{account_name}"
             
+            # 1. Salva immagine intera
             file_path = f"{folder_name}/full.png"
             _, buffer = cv2.imencode('.png', img)
             img_bytes = buffer.tobytes()
             supabase_client.storage.from_(BUCKET_NAME).upload(file_path, img_bytes)
             
+            # 2. Salva le 5 figure ritagliate
             crop_paths = []
             crop_labels = []
             for i, p in enumerate(picmap):
@@ -236,6 +250,7 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
                     crop_paths.append(crop_filename)
                     crop_labels.append(label)
             
+            # 3. Salva metadati
             data = {
                 'account_name': account_name,
                 'image_path': file_path,
@@ -250,6 +265,7 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
             }
             
         else:
+            # Captcha matematico
             prefix = "math"
             table = "math_captchas_analyzer"
             stats['math'] += 1
@@ -281,8 +297,10 @@ def log(msg):
 
 # ==================== SURF ACCOUNT ====================
 def surf_account(account_name, cookie_string, stats, supabase_client):
+    """Esegue surf per un account con refresh periodico della sessione e proxy"""
     
     def init_session(proxy=None):
+        """Crea una sessione con header realistici e proxy opzionale"""
         session = requests.Session()
         
         headers = {
@@ -343,6 +361,20 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 verify=False, timeout=REQUEST_TIMEOUT
             )
             
+            # 🔍 LOG COMPLETO DELLA RISPOSTA DEL SERVER
+            log(f"[{account_name}] 📥 RISPOSTA SERVER:")
+            log(f"[{account_name}]    Status: {r.status_code}")
+            log(f"[{account_name}]    Headers: {dict(r.headers)}")
+            
+            try:
+                data = r.json()
+                log(f"[{account_name}]    Body: {json.dumps(data, indent=2)[:1500]}")
+            except Exception as json_err:
+                log(f"[{account_name}]    Body (raw): {r.text[:500]}")
+                log(f"[{account_name}]    ❌ Errore parsing JSON: {json_err}")
+                time.sleep(3)
+                continue
+            
             if r.status_code != 200:
                 errori_consecutivi += 1
                 log(f"[{account_name}] ⚠️ HTTP {r.status_code}")
@@ -354,16 +386,22 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 time.sleep(5)
                 continue
             
-            data = r.json()
             surfses = data.get("surfses", {})
             urlid = surfses.get("urlid")
             qpic = surfses.get("qpic")
             seconds = int(surfses.get("seconds", 20))
             picmap = data.get("picmap")
             
+            # 🔍 LOG DEI DATI CRITICI
+            log(f"[{account_name}]    urlid: {urlid}")
+            log(f"[{account_name}]    qpic: {qpic}")
+            log(f"[{account_name}]    seconds: {seconds}")
+            log(f"[{account_name}]    picmap: {'✅' if picmap else '❌'}")
+            log(f"[{account_name}]    warning: {data.get('warning', 'nessuno')}")
+            
             if not urlid or not qpic:
                 errori_consecutivi += 1
-                log(f"[{account_name}] ⚠️ Nessun captcha trovato ({errori_consecutivi}/{MAX_ERRORI})")
+                log(f"[{account_name}] ⚠️ urlid={urlid}, qpic={qpic} ({errori_consecutivi}/{MAX_ERRORI})")
                 if errori_consecutivi >= MAX_ERRORI:
                     log(f"[{account_name}] 🔄 Riavvio sessione per captcha assente...")
                     session = init_session(proxy)
@@ -374,6 +412,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             
             errori_consecutivi = 0
             
+            # Scarica l'immagine
             img_data = session.get(
                 f"https://www.easyhits4u.com/simg/{qpic}.jpg",
                 verify=False
@@ -381,6 +420,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
             
             if picmap is not None:
+                # CAPTCHA A FIGURE
                 crops = [crop_safe(img, p.get("coords", "")) for p in picmap]
                 labels = []
                 for crop in crops:
@@ -413,10 +453,12 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 time.sleep(total_delay)
                 
             else:
+                # CAPTCHA MATEMATICO
                 log(f"[{account_name}] 🧮 Captcha matematico - SALVO E FERMO")
                 salva_captcha_analyzer(supabase_client, account_name, qpic, img, None, None, "matematico_non_risolto", urlid, stats)
                 return
             
+            # Invia risposta
             url = f"https://www.easyhits4u.com/surf/?f=surf&urlid={urlid}&surftype=2&ajax=1&word={word}&screen_width=1024&screen_height=768"
             url += "&window_width=1024&window_height=643&top_width=1024&top_height=50"
             url += "&fpcode=TW96aWxsYTsgTmV0c2NhcGU7IDUuMCAoV2luZG93cyk7IFdpbjMy"
@@ -450,7 +492,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
 # ==================== MAIN ====================
 def main():
     log("=" * 60)
-    log("🚀 COLLECTOR ANALYZER V3 - CON PROXY E RITARDO CASUALE")
+    log("🚀 COLLECTOR ANALYZER V3 - DEBUG LOG")
     log("=" * 60)
     
     supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)

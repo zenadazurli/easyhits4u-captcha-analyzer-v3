@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # collector_analyzer_v3.py
 # Raccoglie captcha con figure ritagliate e etichette
-# Con log dettagliati per debug
+# Gestisce figure e matematici
 
 import os
 import sys
@@ -269,10 +269,14 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
             prefix = "math"
             table = "math_captchas_analyzer"
             stats['math'] += 1
-            file_path = f"{prefix}/{timestamp}_{account_name}.png"
-            _, buffer = cv2.imencode('.png', img)
-            img_bytes = buffer.tobytes()
-            supabase_client.storage.from_(BUCKET_NAME).upload(file_path, img_bytes)
+            # Salva l'immagine se disponibile
+            if qpic:
+                file_path = f"{prefix}/{timestamp}_{account_name}.png"
+                _, buffer = cv2.imencode('.png', img)
+                img_bytes = buffer.tobytes()
+                supabase_client.storage.from_(BUCKET_NAME).upload(file_path, img_bytes)
+            else:
+                file_path = None
             
             data = {
                 'account_name': account_name,
@@ -361,20 +365,6 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 verify=False, timeout=REQUEST_TIMEOUT
             )
             
-            # 🔍 LOG COMPLETO DELLA RISPOSTA DEL SERVER
-            log(f"[{account_name}] 📥 RISPOSTA SERVER:")
-            log(f"[{account_name}]    Status: {r.status_code}")
-            log(f"[{account_name}]    Headers: {dict(r.headers)}")
-            
-            try:
-                data = r.json()
-                log(f"[{account_name}]    Body: {json.dumps(data, indent=2)[:1500]}")
-            except Exception as json_err:
-                log(f"[{account_name}]    Body (raw): {r.text[:500]}")
-                log(f"[{account_name}]    ❌ Errore parsing JSON: {json_err}")
-                time.sleep(3)
-                continue
-            
             if r.status_code != 200:
                 errori_consecutivi += 1
                 log(f"[{account_name}] ⚠️ HTTP {r.status_code}")
@@ -386,22 +376,36 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
                 time.sleep(5)
                 continue
             
+            data = r.json()
+            
+            # 🔍 CONTROLLA IL TIPO DI CAPTCHA
+            picmap = data.get("picmap")
             surfses = data.get("surfses", {})
             urlid = surfses.get("urlid")
             qpic = surfses.get("qpic")
             seconds = int(surfses.get("seconds", 20))
-            picmap = data.get("picmap")
             
-            # 🔍 LOG DEI DATI CRITICI
-            log(f"[{account_name}]    urlid: {urlid}")
-            log(f"[{account_name}]    qpic: {qpic}")
-            log(f"[{account_name}]    seconds: {seconds}")
-            log(f"[{account_name}]    picmap: {'✅' if picmap else '❌'}")
-            log(f"[{account_name}]    warning: {data.get('warning', 'nessuno')}")
+            # 🔑 SE PICMAP È NULL → CAPTCHA MATEMATICO
+            if picmap is None:
+                log(f"[{account_name}] 🧮 Captcha matematico rilevato - SALVO E FERMO")
+                # Cerca di salvare l'immagine
+                if qpic:
+                    try:
+                        img_data = session.get(f"https://www.easyhits4u.com/simg/{qpic}.jpg", verify=False).content
+                        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+                        salva_captcha_analyzer(supabase_client, account_name, qpic, img, None, None, "matematico_non_risolto", urlid, stats)
+                    except Exception as e:
+                        log(f"[{account_name}] ❌ Errore scaricamento immagine matematica: {e}")
+                        # Salva comunque senza immagine
+                        salva_captcha_analyzer(supabase_client, account_name, qpic, None, None, None, "matematico_non_risolto", urlid, stats)
+                else:
+                    salva_captcha_analyzer(supabase_client, account_name, qpic, None, None, None, "matematico_non_risolto", urlid, stats)
+                return  # Ferma l'account
             
+            # SE PICMAP ESISTE → CAPTCHA A FIGURE
             if not urlid or not qpic:
                 errori_consecutivi += 1
-                log(f"[{account_name}] ⚠️ urlid={urlid}, qpic={qpic} ({errori_consecutivi}/{MAX_ERRORI})")
+                log(f"[{account_name}] ⚠️ urlid=None, qpic=None ({errori_consecutivi}/{MAX_ERRORI})")
                 if errori_consecutivi >= MAX_ERRORI:
                     log(f"[{account_name}] 🔄 Riavvio sessione per captcha assente...")
                     session = init_session(proxy)
@@ -419,44 +423,37 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             ).content
             img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
             
-            if picmap is not None:
-                # CAPTCHA A FIGURE
-                crops = [crop_safe(img, p.get("coords", "")) for p in picmap]
-                labels = []
-                for crop in crops:
-                    if crop is not None and crop.size > 0:
-                        label = predict_figure(crop)
-                        labels.append(label)
-                    else:
-                        labels.append(None)
-                
-                seen = {}
-                chosen_idx = None
-                for i, label in enumerate(labels):
-                    if label and label != "errore":
-                        if label in seen:
-                            chosen_idx = seen[label]
-                            break
-                        seen[label] = i
-                
-                if chosen_idx is None:
-                    log(f"[{account_name}] ❌ Nessun duplicato trovato")
-                    salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, labels, "nessun_duplicato", urlid, stats)
-                    return
-                
-                word = picmap[chosen_idx]["value"]
-                
-                # 🔑 ATTESA CON RITARDO CASUALE
-                delay_extra = random.uniform(0.5, 3.0)
-                total_delay = seconds + delay_extra
-                log(f"[{account_name}] ⏳ Attesa {total_delay:.1f} secondi ({seconds}s + {delay_extra:.1f}s extra)...")
-                time.sleep(total_delay)
-                
-            else:
-                # CAPTCHA MATEMATICO
-                log(f"[{account_name}] 🧮 Captcha matematico - SALVO E FERMO")
-                salva_captcha_analyzer(supabase_client, account_name, qpic, img, None, None, "matematico_non_risolto", urlid, stats)
+            # Risolvi captcha a figure
+            crops = [crop_safe(img, p.get("coords", "")) for p in picmap]
+            labels = []
+            for crop in crops:
+                if crop is not None and crop.size > 0:
+                    label = predict_figure(crop)
+                    labels.append(label)
+                else:
+                    labels.append(None)
+            
+            seen = {}
+            chosen_idx = None
+            for i, label in enumerate(labels):
+                if label and label != "errore":
+                    if label in seen:
+                        chosen_idx = seen[label]
+                        break
+                    seen[label] = i
+            
+            if chosen_idx is None:
+                log(f"[{account_name}] ❌ Nessun duplicato trovato")
+                salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, labels, "nessun_duplicato", urlid, stats)
                 return
+            
+            word = picmap[chosen_idx]["value"]
+            
+            # 🔑 ATTESA CON RITARDO CASUALE
+            delay_extra = random.uniform(0.5, 3.0)
+            total_delay = seconds + delay_extra
+            log(f"[{account_name}] ⏳ Attesa {total_delay:.1f} secondi ({seconds}s + {delay_extra:.1f}s extra)...")
+            time.sleep(total_delay)
             
             # Invia risposta
             url = f"https://www.easyhits4u.com/surf/?f=surf&urlid={urlid}&surftype=2&ajax=1&word={word}&screen_width=1024&screen_height=768"
@@ -492,7 +489,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
 # ==================== MAIN ====================
 def main():
     log("=" * 60)
-    log("🚀 COLLECTOR ANALYZER V3 - DEBUG LOG")
+    log("🚀 COLLECTOR ANALYZER V3 - CON GESTIONE FIGURE E MATEMATICI")
     log("=" * 60)
     
     supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)

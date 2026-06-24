@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # collector_analyzer_v3.py
 # Raccoglie captcha con figure ritagliate e etichette
-# Gestisce figure e matematici
+# Gestisce figure e matematici con risolutore integrato
 
 import os
 import sys
@@ -12,10 +12,13 @@ import requests
 import json
 import numpy as np
 import cv2
+import re
 from datetime import datetime
 from supabase import create_client
 from datasets import load_dataset
 import urllib3
+import ddddocr
+import easyocr
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -73,14 +76,8 @@ y_fast = None
 classes_fast = None
 proxy_index = 0
 proxy_lock = threading.Lock()
-
-def get_next_proxy():
-    """Restituisce il prossimo proxy in rotazione (round-robin)"""
-    global proxy_index
-    with proxy_lock:
-        proxy = PROXY_LIST[proxy_index % len(PROXY_LIST)]
-        proxy_index += 1
-        return proxy
+dddd_ocr = None
+easy_reader = None
 
 # ==================== FUNZIONI DATASET ====================
 def load_dataset_from_hf():
@@ -125,6 +122,186 @@ def load_dataset_from_hf():
     except Exception as e:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Errore caricamento dataset: {e}", flush=True)
         return False
+
+# ==================== FUNZIONI RISOLUTORE MATEMATICO ====================
+def init_math_ocr():
+    """Inizializza OCR per captcha matematici"""
+    global dddd_ocr, easy_reader
+    try:
+        dddd_ocr = ddddocr.DdddOcr()
+        dddd_ocr.set_ranges("0123456789+-")
+        easy_reader = easyocr.Reader(['en'], gpu=False)
+        log("✅ OCR matematici inizializzati")
+        return True
+    except Exception as e:
+        log(f"❌ Errore inizializzazione OCR: {e}")
+        return False
+
+def risolvi_captcha_matematico(img, surfses):
+    """
+    Risolve captcha matematico con denoise elastico
+    Restituisce: (segno, risultato, a, b) o (None, None, None, None)
+    """
+    if img is None or dddd_ocr is None:
+        return None, None, None, None
+    
+    # Assicurati che sia in scala di grigi
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+    
+    migliore = None
+    miglior_punteggio = -1
+    
+    # Denoise elastico (3-30, step 2)
+    for forza in range(3, 31, 2):
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(gray, None, forza, 7, 21)
+        _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Estrai caratteri con coordinate
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        caratteri = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            if area < 20 or area > 500:
+                continue
+            
+            roi = binary[y:y+h, x:x+w]
+            roi = cv2.copyMakeBorder(roi, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=0)
+            _, buffer = cv2.imencode('.png', roi)
+            risultato = dddd_ocr.classification(buffer.tobytes())
+            if risultato and risultato in "0123456789+-":
+                caratteri.append({'c': risultato, 'x': x, 'w': w})
+        
+        if len(caratteri) < 2:
+            continue
+        
+        caratteri.sort(key=lambda c: c['x'])
+        
+        # Cerca segno
+        segno = None
+        for c in caratteri:
+            if c['c'] in ['+', '-']:
+                segno = c['c']
+                break
+        
+        # Separa numeri con segno
+        if segno:
+            numeri = []
+            corrente = []
+            for c in caratteri:
+                if c['c'] == segno:
+                    if corrente:
+                        numeri.append(int(''.join(corrente)))
+                        corrente = []
+                elif c['c'].isdigit():
+                    corrente.append(c['c'])
+            if corrente:
+                numeri.append(int(''.join(corrente)))
+            
+            if len(numeri) >= 2:
+                punteggio = numeri[0] + numeri[1]
+                if punteggio > miglior_punteggio:
+                    miglior_punteggio = punteggio
+                    migliore = (numeri[0], segno, numeri[1])
+                continue
+        
+        # Separa per distanza (se il segno manca)
+        numeri = []
+        corrente = []
+        ultima_x = caratteri[0]['x']
+        for c in caratteri:
+            if not c['c'].isdigit():
+                continue
+            if c['x'] - ultima_x > 30:
+                if corrente:
+                    numeri.append(int(''.join(corrente)))
+                    corrente = []
+            corrente.append(c['c'])
+            ultima_x = c['x'] + c['w']
+        if corrente:
+            numeri.append(int(''.join(corrente)))
+        
+        if len(numeri) >= 2:
+            punteggio = numeri[0] + numeri[1]
+            if punteggio > miglior_punteggio:
+                miglior_punteggio = punteggio
+                migliore = (numeri[0], '+', numeri[1])
+    
+    # Se DdddOcr fallisce, prova EasyOCR
+    if migliore is None and easy_reader is not None:
+        try:
+            risultato = easy_reader.readtext(gray, detail=0)
+            testo = ' '.join(risultato)
+            if testo:
+                # Converti parole in numeri
+                word_to_num = {
+                    'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+                    'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+                    'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13',
+                    'fourteen': '14', 'fifteen': '15', 'sixteen': '16', 'seventeen': '17',
+                    'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+                    'plus': '+', 'minus': '-', 'and': '+'
+                }
+                for word, num in word_to_num.items():
+                    testo = testo.lower().replace(word, str(num))
+                
+                match = re.search(r'(\d+)\s*([+\-])\s*(\d+)', testo)
+                if match:
+                    migliore = (int(match.group(1)), match.group(2), int(match.group(3)))
+        except Exception as e:
+            log(f"⚠️ Errore EasyOCR: {e}")
+    
+    if migliore is None:
+        return None, None, None, None
+    
+    a, segno, b = migliore
+    
+    # Calcola entrambi i risultati
+    r_plus = a + b
+    r_minus = a - b
+    
+    # Usa i dati del server per scegliere
+    opzioni = []
+    for key in ['aword1_number', 'aword2_number', 'aword3_number']:
+        val = surfses.get(key)
+        if val is not None:
+            opzioni.append(int(val))
+    
+    if opzioni:
+        if r_plus in opzioni:
+            return '+', r_plus, a, b
+        elif r_minus in opzioni:
+            return '-', r_minus, a, b
+    
+    # Se il server non aiuta, usa il segno trovato
+    if segno in ['+', '-']:
+        return segno, a + b if segno == '+' else a - b, a, b
+    
+    return '+', r_plus, a, b
+
+def numero_a_parola(num):
+    """Converte numero in parola inglese"""
+    mappa = {
+        1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five',
+        6: 'six', 7: 'seven', 8: 'eight', 9: 'nine', 10: 'ten',
+        11: 'eleven', 12: 'twelve', 13: 'thirteen', 14: 'fourteen',
+        15: 'fifteen', 16: 'sixteen', 17: 'seventeen', 18: 'eighteen',
+        19: 'nineteen', 20: 'twenty'
+    }
+    return mappa.get(num, str(num))
+
+# ==================== FUNZIONI PROXY ====================
+def get_next_proxy():
+    """Restituisce il prossimo proxy in rotazione (round-robin)"""
+    global proxy_index
+    with proxy_lock:
+        proxy = PROXY_LIST[proxy_index % len(PROXY_LIST)]
+        proxy_index += 1
+        return proxy
 
 # ==================== FUNZIONI FIGURE ====================
 def centra_figura(image):
@@ -269,8 +446,9 @@ def salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, lab
             prefix = "math"
             table = "math_captchas_analyzer"
             stats['math'] += 1
+            
             # Salva l'immagine se disponibile
-            if qpic:
+            if img is not None:
                 file_path = f"{prefix}/{timestamp}_{account_name}.png"
                 _, buffer = cv2.imencode('.png', img)
                 img_bytes = buffer.tobytes()
@@ -387,20 +565,54 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             
             # 🔑 SE PICMAP È NULL → CAPTCHA MATEMATICO
             if picmap is None:
-                log(f"[{account_name}] 🧮 Captcha matematico rilevato - SALVO E FERMO")
-                # Cerca di salvare l'immagine
-                if qpic:
-                    try:
-                        img_data = session.get(f"https://www.easyhits4u.com/simg/{qpic}.jpg", verify=False).content
-                        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
-                        salva_captcha_analyzer(supabase_client, account_name, qpic, img, None, None, "matematico_non_risolto", urlid, stats)
-                    except Exception as e:
-                        log(f"[{account_name}] ❌ Errore scaricamento immagine matematica: {e}")
-                        # Salva comunque senza immagine
-                        salva_captcha_analyzer(supabase_client, account_name, qpic, None, None, None, "matematico_non_risolto", urlid, stats)
+                log(f"[{account_name}] 🧮 Captcha matematico rilevato")
+                
+                # Scarica l'immagine
+                try:
+                    img_data = session.get(f"https://www.easyhits4u.com/simg/{qpic}.jpg", verify=False).content
+                    img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+                except Exception as e:
+                    log(f"[{account_name}] ❌ Errore scaricamento immagine: {e}")
+                    salva_captcha_analyzer(supabase_client, account_name, qpic, None, None, None, "matematico_errore_scaricamento", urlid, stats)
+                    # Continua con il prossimo captcha invece di fermare l'account
+                    time.sleep(random.uniform(1.5, 3.0))
+                    continue
+                
+                # Risolvi con il risolutore matematico
+                segno, risultato, a, b = risolvi_captcha_matematico(img, surfses)
+                
+                if segno:
+                    word = numero_a_parola(risultato)
+                    log(f"[{account_name}] ✅ Risolto: {a} {segno} {b} = {risultato} → {word}")
+                    
+                    # Attendi il tempo minimo
+                    time.sleep(seconds)
+                    
+                    # Invia risposta
+                    url = f"https://www.easyhits4u.com/surf/?f=surf&urlid={urlid}&surftype=2&ajax=1&word={word}&screen_width=1024&screen_height=768"
+                    url += "&window_width=1024&window_height=643&top_width=1024&top_height=50"
+                    url += "&fpcode=TW96aWxsYTsgTmV0c2NhcGU7IDUuMCAoV2luZG93cyk7IFdpbjMy"
+                    url += f"&cit={int(time.time() * 1000)}&try=1"
+                    
+                    resp = session.get(url, verify=False, timeout=REQUEST_TIMEOUT)
+                    response_data = resp.json()
+                    
+                    if response_data.get("warning") == "wrong_choice":
+                        log(f"[{account_name}] ❌ Risposta sbagliata ({word}) - salvo")
+                        # Salva quelli sbagliati
+                        salva_captcha_analyzer(supabase_client, account_name, qpic, img, None, None, "matematico_wrong", urlid, stats)
+                        # Continua con il prossimo captcha
+                    else:
+                        log(f"[{account_name}] ✅ OK!")
+                        stats['risolti'] += 1
                 else:
-                    salva_captcha_analyzer(supabase_client, account_name, qpic, None, None, None, "matematico_non_risolto", urlid, stats)
-                return  # Ferma l'account
+                    log(f"[{account_name}] ❌ Non risolto - salvo")
+                    # Salva quelli non risolti
+                    salva_captcha_analyzer(supabase_client, account_name, qpic, img, None, None, "matematico_non_risolto", urlid, stats)
+                
+                # Attendi prima del prossimo captcha (non fermare l'account)
+                time.sleep(random.uniform(1.5, 3.0))
+                continue
             
             # SE PICMAP ESISTE → CAPTCHA A FIGURE
             if not urlid or not qpic:
@@ -445,6 +657,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             if chosen_idx is None:
                 log(f"[{account_name}] ❌ Nessun duplicato trovato")
                 salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, labels, "nessun_duplicato", urlid, stats)
+                # Ferma l'account solo per i captcha figure
                 return
             
             word = picmap[chosen_idx]["value"]
@@ -467,6 +680,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
             if response_data.get("warning") == "wrong_choice":
                 log(f"[{account_name}] ❌ Risposta sbagliata: {word}")
                 salva_captcha_analyzer(supabase_client, account_name, qpic, img, picmap, labels, "wrong_choice", urlid, stats)
+                # Per i figure, ferma l'account
                 return
             
             captcha_counter += 1
@@ -489,7 +703,7 @@ def surf_account(account_name, cookie_string, stats, supabase_client):
 # ==================== MAIN ====================
 def main():
     log("=" * 60)
-    log("🚀 COLLECTOR ANALYZER V3 - CON GESTIONE FIGURE E MATEMATICI")
+    log("🚀 COLLECTOR ANALYZER V3 - CON RISOLUTORE MATEMATICO")
     log("=" * 60)
     
     supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -501,6 +715,10 @@ def main():
     if not load_dataset_from_hf():
         log("❌ Dataset non caricato")
         return
+    
+    # Inizializza OCR matematici
+    if not init_math_ocr():
+        log("⚠️ OCR matematici non inizializzati, continuo solo con le figure")
     
     try:
         result = cookie_supabase.table('account_cookies')\
